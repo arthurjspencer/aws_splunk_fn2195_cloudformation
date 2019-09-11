@@ -1,0 +1,806 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Build a Cluster Mastster
+Parameters:
+  IndexerInstanceType:
+    Description: Instance type to launch EC2 Indexer instances.
+    Type: String
+    Default: t2.micro
+    AllowedValues: [ t2.micro, m5.large, m5.xlarge, m5.4xlarge, m5.16xlarge, i3.4xlarge, i3en.3xlarge ]
+  SHInstanceType:
+    Description: Instance type to launch EC2 Search Head (actually all non IDX) instances.
+    Type: String
+    Default: t2.micro
+    AllowedValues: [ t2.micro, m5.large, m5.xlarge, m5.4xlarge, m5.16xlarge, i3.4xlarge, i3en.3xlarge ]
+  VPCID:
+    Description: What VPC will you be running this stack on?
+    Type: String
+    Default: vpc-2c3c2944
+  DisableApiTermination:
+    Type: String
+    Description: Prevent APIs, including CloudFormation, from being able to delete EC2 instances
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+  DeleteOnTermination:
+    Type: String
+    Description: Should EBS volumes be deleted upon instance termination?
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  SplunkSecurityGroup:
+    Description: What Security Group do you wish to use
+    Type: String
+    Default: sg-02173e5e6f2cb45c8
+  IamInstanceProfile:
+    Description: What IAM Policy should be applied to these machines
+    Type: String
+    Default: EC2S3FULL
+  KeyName:
+    Description: What Key should be used
+    Type: String
+    Default: awslab
+  AwsS3Bucket:
+    Type: String
+    Description: Name of the bucket for Splunk install scripts
+    Default: ajs-aws-splunk
+  AssociatePublicIpAddress:
+    Type: String
+    Description: Should a Public IP be given to management devices - good for troubleshooting
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  SplunkHome:
+    Type: String
+    Description: Name of the directory to install Splunk
+    Default: /opt/splunk
+  SplunkSystemUser:
+    Type: String
+    Description: Name of the user that Splunk is to be installed as
+    Default: splunk
+  SplunkAdminUser:
+    Type: String
+    Description: Name of the Splunkadmin user
+    Default: admin
+  SplunkAdminPassword:
+    Type: String
+    Description: Splunk Admin user password
+    Default: changeme1
+  NumberOfAZs:
+    Type: String
+    Description: Number of Availability Zones
+    Default: 3
+  IndexClusterLabel:
+    Type: String
+    Description: Name of the Index Cluster
+    Default: idxcluster
+  SearchClusterLabel:
+    Type: String
+    Description: Name of the Search Cluster
+    Default: shcluster
+  SplunkGeneralSecret:
+    Type: String
+    Description: Splunk General Secret
+    Default: password1
+  SplunkClusterSecret:
+    Type: String
+    Description: Splunk Cluster Secret
+    Default: password2
+  SplunkIndexDiscoverySecret:
+    Type: String
+    Description: Splunk Index Discovery Secret
+    Default: password3
+  IDXHotVolumeType:
+    Type: String
+    Description: What type of storage should be provisioned for HOT/WARM Storage
+    AllowedValues:
+      - 'gp2'
+    Default: 'gp2'
+  IDXHotVolumeSize:
+    Type: String
+    Description: How many GB do you want to allocate to HOT/WARM storage
+    Default: 20
+  IDXColdVolumeType:
+    Type: String
+    Description: What type of storage should be provisioned for Cold Storage
+    AllowedValues:
+      - 'gp2'
+    Default: 'gp2'
+  IDXColdVolumeSize:
+    Type: String
+    Description: How many GB do you want to allocate to Cold storage
+    Default: 20
+  SHVolumeType:
+    Type: String
+    Description: What type of storage should be provisioned for SH Storage
+    AllowedValues:
+      - 'gp2'
+      - 'io1'
+      - 'sc1'
+      - 'sc2'
+    Default: 'gp2'
+  SHVolumeSize:
+    Type: String
+    Description: How many GB do you want to allocate to SH storage
+    Default: 20
+Resources:
+  SecurityGroupSplunkBase:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPCID
+      GroupDescription: Enable Splunk Web - 8000 and splunkd 8089
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 8089
+          ToPort: 8089
+          CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: securitygroup
+        - Key: Name
+          Value: SplunkBase
+  SecurityGroupIDXCluster:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPCID
+      GroupDescription: Enable port 8080 for replication and 9997 for forwarder traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 9997
+          ToPort: 9997
+          CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: securitygroup
+        - Key: Name
+          Value: SplunkIndexer
+  SecurityGroupSHCluster:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPCID
+      GroupDescription: Enable port 8090 for replication and 8191 for KVStore Replication
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8090
+          ToPort: 8090
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: tcp
+          FromPort: 8091
+          ToPort: 8091
+          CidrIp: '0.0.0.0/0'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: securitygroup
+        - Key: Name
+          Value: SplunkSHC
+  CM:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2a
+      InstanceType: !Ref SHInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: cluster-master
+        - Key: Name
+          Value: cluster-master
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/cm.sh /tmp/cm.sh
+            export hostname=cm
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/cm.sh
+            sudo -E /tmp/cm.sh
+            rm -f /tmp/cm.sh
+  IDX1:
+    DependsOn: CM
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref IDXHotVolumeType
+            VolumeSize: !Ref IDXHotVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdc
+          Ebs:
+            VolumeType: !Ref IDXColdVolumeType
+            VolumeSize: !Ref IDXColdVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+            - !Ref SecurityGroupIDXCluster
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2a
+      InstanceType: !Ref IndexerInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: indexer
+        - Key: Name
+          Value: idx1
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/idx.sh /tmp/idx.sh
+            export hostname=idx1
+            export site=site1
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/idx.sh
+            sudo -E /tmp/idx.sh
+            rm -f /tmp/idx.sh
+  IDX2:
+    DependsOn: CM
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref IDXHotVolumeType
+            VolumeSize: !Ref IDXHotVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdc
+          Ebs:
+            VolumeType: !Ref IDXColdVolumeType
+            VolumeSize: !Ref IDXColdVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+            - !Ref SecurityGroupIDXCluster
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2b
+      InstanceType: !Ref IndexerInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: indexer
+        - Key: Name
+          Value: idx2
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/idx.sh /tmp/idx.sh
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export hostname=idx2
+            export site=site2
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/idx.sh
+            sudo -E /tmp/idx.sh
+  IDX3:
+    DependsOn: CM
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref IDXHotVolumeType
+            VolumeSize: !Ref IDXHotVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdc
+          Ebs:
+            VolumeType: !Ref IDXColdVolumeType
+            VolumeSize: !Ref IDXColdVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+            - !Ref SecurityGroupIDXCluster
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2c
+      InstanceType: !Ref IndexerInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: indexer
+        - Key: Name
+          Value: idx3
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/idx.sh /tmp/idx.sh
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export hostname=idx3
+            export site=site3
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/idx.sh
+            sudo -E /tmp/idx.sh
+  DEPLOYER:
+    DependsOn: CM
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      InstanceType: !Ref SHInstanceType
+      AvailabilityZone: us-east-2a
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: deployer
+        - Key: Name
+          Value: deployer
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/deployer.sh /tmp/deployer.sh
+            export hostname=deployer
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/deployer.sh
+            sudo -E /tmp/deployer.sh
+            rf -f deployer.sh
+  SH1:
+    DependsOn: DEPLOYER
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+            - !Ref SecurityGroupSHCluster
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2a
+      InstanceType: !Ref SHInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: sh
+        - Key: Name
+          Value: sh1
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/sh.sh /tmp/sh.sh
+            export hostname=sh1
+            export splunk_role=shc
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export DeployerPrivateIp=${DEPLOYER.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/sh.sh
+            sudo -E /tmp/sh.sh
+            rm -f /tmp/sh.sh
+  SH2:
+    DependsOn: DEPLOYER
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+            - !Ref SecurityGroupSHCluster
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2b
+      InstanceType: !Ref SHInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: sh
+        - Key: Name
+          Value: sh2
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/sh.sh /tmp/sh.sh
+            export hostname=sh2
+            export splunk_role=shc
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export DeployerPrivateIp=${DEPLOYER.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/sh.sh
+            sudo -E /tmp/sh.sh
+            rm -f /tmp/sh.sh
+  SH3:
+    DependsOn: 
+      - SH1
+      - SH2
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+            - !Ref SecurityGroupSHCluster
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2c
+      InstanceType: !Ref SHInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: sh
+        - Key: Name
+          Value: sh3
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/sh.sh /tmp/sh.sh
+            export hostname=sh3
+            export splunk_role=shc_captain
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export DeployerPrivateIp=${DEPLOYER.PrivateIp}
+            export SHCMember1PrivateIp=${SH1.PrivateIp}
+            export SHCMember2PrivateIp=${SH2.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/sh.sh
+            sudo -E /tmp/sh.sh
+            rm -f /tmp/sh.sh
+  HF1:
+    DependsOn: 
+      - IDX1
+      - IDX2
+      - IDX3
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2a
+      InstanceType: !Ref SHInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: HF
+        - Key: Name
+          Value: hf1
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/sh.sh /tmp/sh.sh
+            export hostname=hf1
+            export splunk_role=hf
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export DeployerPrivateIp=${DEPLOYER.PrivateIp}
+            export SHCMember1PrivateIp=${SH1.PrivateIp}
+            export SHCMember2PrivateIp=${SH2.PrivateIp}
+            export SHCMember3PrivateIp=${SH3.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/sh.sh
+            sudo -E /tmp/sh.sh
+            rm -f /tmp/sh.sh
+  DMC:
+    DependsOn: 
+      - SH3
+      - HF1
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      DisableApiTermination: !Ref DisableApiTermination
+      IamInstanceProfile: !Ref IamInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: 20
+            DeleteOnTermination: !Ref DeleteOnTermination
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: !Ref SHVolumeType
+            VolumeSize: !Ref SHVolumeSize
+            DeleteOnTermination: !Ref DeleteOnTermination
+      NetworkInterfaces:
+        - GroupSet:
+            - !Ref SecurityGroupSplunkBase
+          AssociatePublicIpAddress: !Ref AssociatePublicIpAddress
+          DeviceIndex: '0'
+          DeleteOnTermination: true
+      ImageId: !ImportValue splunk-golden-ami
+      AvailabilityZone: us-east-2a
+      InstanceType: !Ref SHInstanceType
+      KeyName: !Ref KeyName
+      Tags:
+        - Key: Application
+          Value: !Ref 'AWS::StackId'
+        - Key: Role
+          Value: dmc
+        - Key: Name
+          Value: dmc
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -v
+            aws s3 cp s3://${AwsS3Bucket}/bash/sh.sh /tmp/sh.sh
+            export hostname=dmc
+            export splunk_role=dmc
+            export ClusterMasterPrivateIp=${CM.PrivateIp}
+            export DeployerPrivateIp=${DEPLOYER.PrivateIp}
+            export SHCMember1PrivateIp=${SH1.PrivateIp}
+            export SHCMember2PrivateIp=${SH2.PrivateIp}
+            export SHCMember3PrivateIp=${SH3.PrivateIp}
+            export HF1PrivateIp=${HF1.PrivateIp}
+            export SPLUNK_HOME=${SplunkHome}
+            export AWS_S3_BUCKET=${AwsS3Bucket}
+            export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+            export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+            export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+            export SPLUNK_GENERAL_SECRET=${SplunkGeneralSecret}
+            export SPLUNK_CLUSTER_SECRET=${SplunkClusterSecret}
+            export SPLUNK_INDEX_DISCOVERY_SECRET=${SplunkIndexDiscoverySecret}
+            export NumberOfAZs=${NumberOfAZs}
+            export INDEX_CLUSTER_LABEL=${IndexClusterLabel}
+            export SEARCH_CLUSTER_LABEL=${SearchClusterLabel}
+            chmod 755 /tmp/sh.sh
+            sudo -E /tmp/sh.sh
+            rm -f /tmp/sh.sh
+
+
+
+

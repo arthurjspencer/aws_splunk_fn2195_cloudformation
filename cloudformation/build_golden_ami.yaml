@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Build a Splunk Golden Image
+Parameters:
+  AmiBaseId:
+    Description: What is the base AMI that is to be used to create Splunk Golden Image
+    Type: String
+    Default: ami-00c79db59589996b9
+  InstanceType:
+    Description: Instance type to launch EC2 instances.
+    Type: String
+    Default: t2.micro
+    AllowedValues: [ t2.micro, m3.medium, m3.large, m3.xlarge, m3.2xlarge ]
+  IamInstanceProfile:
+    Description: What IAM Policy should be applied to these machines
+    Type: String
+    Default: EC2S3FULL
+  SecurityGroup:
+    Description: What Security Group Should be used
+    Type: String
+    Default: default
+  KeyName:
+    Description: What AWS Key is to be used for SSH access to this Instance
+    Type: String
+    Default: awslab
+  AwsS3Bucket:
+    Type: String
+    Description: Name of the bucket for Splunk install scripts
+    Default: ajs-aws-splunk
+  SplunkTarball:
+    Type: String
+    Description: Name of the tarball to install Splunk
+    Default: splunk-7.3.1-bd63e13aa157-Linux-x86_64.tgz
+  SplunkHome:
+    Type: String
+    Description: Name of the directory to install Splunk
+    Default: /opt/splunk
+  SplunkSystemUser:
+    Type: String
+    Description: Name of the user that Splunk is to be installed as
+    Default: splunk
+  SplunkAdminUser:
+    Type: String
+    Description: Name of the Splunkadmin user
+    Default: admin
+  SplunkAdminPassword:
+    Type: String
+    Description: Splunk Admin user password
+    Default: changeme1
+Resources:
+  Instance:
+    Type: "AWS::EC2::Instance"
+    Properties: 
+        ImageId: !Ref AmiBaseId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        Tags:
+          - Key: Application
+            Value: !Ref 'AWS::StackId'
+          - Key: Role
+            Value: golden-image
+          - Key: Name
+            Value: golden-image
+        BlockDeviceMappings:
+          - Ebs:
+              DeleteOnTermination: True
+              Encrypted: True
+              VolumeSize: 20
+              VolumeType: gp2
+            DeviceName: /dev/sdb
+        SecurityGroups:
+          - !Ref SecurityGroup
+        IamInstanceProfile: !Ref IamInstanceProfile
+        UserData:
+          "Fn::Base64":
+            !Sub |
+              #!/bin/bash -v
+              export SPLUNK_HOME=${SplunkHome}
+              export AWS_S3_BUCKET=${AwsS3Bucket}
+              export SPLUNK_TARBALL=${SplunkTarball}
+              export SPLUNK_SYSTEM_USER=${SplunkSystemUser}
+              export SPLUNK_ADMIN_USER=${SplunkAdminUser}
+              export SPLUNK_ADMIN_PASSWORD=${SplunkAdminPassword}
+              aws s3 cp s3://${AwsS3Bucket}/bash/golden_image.sh /tmp/golden_image.sh
+              chmod 755 /tmp/golden_image.sh
+              sudo -E /tmp/golden_image.sh
+              rm -f /tmp/golden_image.sh
+              /opt/aws/bin/cfn-signal \
+              -e $? \
+              --stack ${AWS::StackName} \
+              --region ${AWS::Region} \
+              --resource AMICreate
+              shutdown -h now
+  AMICreate:
+    Type: AWS::CloudFormation::WaitCondition
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+  AMI:
+    Type: Custom::AMI
+    DeletionPolicy: Retain
+    DependsOn: AMICreate
+    Properties:
+      ServiceToken: !GetAtt AMIFunction.Arn
+      InstanceId: !Ref Instance
+  AMIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import logging
+          import cfnresponse
+          import json
+          import boto3
+          from threading import Timer
+          from botocore.exceptions import WaiterError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+
+            ec2 = boto3.resource('ec2')
+            physicalId = event['PhysicalResourceId'] if 'PhysicalResourceId' in event else None
+
+            def success(data={}):
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, data, physicalId)
+
+            def failed(e):
+              cfnresponse.send(event, context, cfnresponse.FAILED, str(e), physicalId)
+
+            logger.info('Request received: %s\n' % json.dumps(event))
+
+            try:
+              instanceId = event['ResourceProperties']['InstanceId']
+              if (not instanceId):
+                raise 'InstanceID required'
+
+              if not 'RequestType' in event:
+                success({'Data': 'Unhandled request type'})
+                return
+
+              if event['RequestType'] == 'Delete':
+                if (not physicalId.startswith('ami-')):
+                  raise 'Unknown PhysicalId: %s' % physicalId
+
+                ec2client = boto3.client('ec2')
+                images = ec2client.describe_images(ImageIds=[physicalId])
+                for image in images['Images']:
+                  ec2.Image(image['ImageId']).deregister()
+                  snapshots = ([bdm['Ebs']['SnapshotId'] 
+                                for bdm in image['BlockDeviceMappings'] 
+                                if 'Ebs' in bdm and 'SnapshotId' in bdm['Ebs']])
+                  for snapshot in snapshots:
+                    ec2.Snapshot(snapshot).delete()
+
+                success({'Data': 'OK'})
+              elif event['RequestType'] in set(['Create', 'Update']):
+                if not physicalId:  # AMI creation has not been requested yet
+                  instance = ec2.Instance(instanceId)
+                  instance.wait_until_stopped()
+
+                  image = instance.create_image(Name="Splunk_Golden_Image")
+
+                  physicalId = image.image_id
+                else:
+                  logger.info('Continuing in awaiting image available: %s\n' % physicalId)
+
+                ec2client = boto3.client('ec2')
+                waiter = ec2client.get_waiter('image_available')
+
+                try:
+                  waiter.wait(ImageIds=[physicalId], WaiterConfig={'Delay': 30, 'MaxAttempts': 6})
+                except WaiterError as e:
+                  # Request the same event but set PhysicalResourceId so that the AMI is not created again
+                  event['PhysicalResourceId'] = physicalId
+                  logger.info('Timeout reached, continuing function: %s\n' % json.dumps(event))
+                  lambda_client = boto3.client('lambda')
+                  lambda_client.invoke(FunctionName=context.invoked_function_arn, 
+                                        InvocationType='Event',
+                                        Payload=json.dumps(event))
+                  return
+
+                success({'Data': 'OK'})
+              else:
+                success({'Data': 'OK'})
+            except Exception as e:
+              failed(e)
+      Runtime: python2.7
+      Timeout: 300
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: {Service: [lambda.amazonaws.com]}
+          Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+      - PolicyName: EC2Policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+              - 'ec2:DescribeInstances'
+              - 'ec2:DescribeImages'
+              - 'ec2:CreateImage'
+              - 'ec2:DeregisterImage'
+              - 'ec2:DescribeSnapshots'
+              - 'ec2:DeleteSnapshot'
+              Resource: ['*']
+Outputs:
+  AMI:
+    Value: !Ref AMI
+    Export:
+      Name: splunk-golden-ami
